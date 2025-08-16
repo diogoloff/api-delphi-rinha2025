@@ -1,26 +1,14 @@
-unit unHealthHelper;
-
-{$mode objfpc}{$H+}
+﻿unit unHealthHelper;
 
 interface
 
 uses
-    Classes,
-    SysUtils,
-    DateUtils,
-    SyncObjs,
-    unGenerica,
-    mormot.core.base,
-    mormot.core.json,
-    mormot.core.variants,
-    mormot.net.client,
-    mormot.core.os,
-    mormot.net.sock;
+    System.Classes, System.SysUtils, System.SyncObjs, System.JSON, System.DateUtils,
+    System.Net.HttpClient, System.Net.URLClient, System.NetConsts,
+    unGenerica;
 
 type
-
     { TWorkerMonitor }
-    TProc = procedure of object;
 
     TWorkerMonitor = class(TThread)
     private
@@ -37,15 +25,16 @@ type
         FMonitorLock: TCriticalSection;
         FDefaultAtivo: Integer;
         FUltimaVerificacao: TDateTime;
-        FHealthURL: RawUtf8;
+        FHealthURL: string;
         FMonitoramentoAtivo: Boolean;
         FThreadMonitorar: TWorkerMonitor;
+        FClient : THTTPClient;
 
         procedure ThreadMonitorar;
         procedure ExecutarHealthCheck;
         procedure Finalizar;
     public
-        constructor Create(const AHealthURL: RawUtf8);
+        constructor Create(const AHealthURL: String);
         destructor Destroy; override;
 
         procedure Iniciar;
@@ -55,11 +44,11 @@ type
         procedure SetDefaultAtivo(const AValue: Boolean);
     end;
 
+procedure IniciarHealthCk(const AHealthURL: String);
+procedure FinalizarHealthCk;
+
 var
     ServiceHealthMonitor: TServiceHealthMonitor;
-
-procedure IniciarHealthCk(const AHealthURL: RawUtf8);
-procedure FinalizarHealthCk;
 
 implementation
 
@@ -80,7 +69,7 @@ end;
 
 { TServiceHealthMonitor }
 
-constructor TServiceHealthMonitor.Create(const AHealthURL: RawUtf8);
+constructor TServiceHealthMonitor.Create(const AHealthURL: String);
 begin
     FEventoVerificar := TEvent.Create(nil, False, False, '');
     FMonitorLock := TCriticalSection.Create;
@@ -88,6 +77,13 @@ begin
     FUltimaVerificacao := IncSecond(Now, -6);
     FHealthURL := AHealthURL;
     FMonitoramentoAtivo := True;
+
+    FClient := THTTPClient.Create;
+    FClient.ConnectionTimeout := FConTimeOut;
+    FClient.ResponseTimeout := FReadTimeOut;
+    FClient.ContentType:= 'application/json';
+    FClient.CustomHeaders['User-Agent'] := 'RinhaDelphi/1.0';
+    FClient.CustomHeaders['Connection'] := 'keep-alive';
 end;
 
 destructor TServiceHealthMonitor.Destroy;
@@ -96,47 +92,30 @@ begin
 
     FEventoVerificar.Free;
     FMonitorLock.Free;
+    FClient.Free;
     inherited Destroy;
 end;
 
 procedure TServiceHealthMonitor.ExecutarHealthCheck;
 var
-    lClient: THttpClientSocket;
-    liStatusCode: Integer;
-    lResJson: TDocVariantData;
-
+    lResJson: TJSONObject;
     lFailing: Boolean;
-    lMinResponseTime: Integer;
+
+    lResposta: IHTTPResponse;
 begin
     lFailing := False;
-    lMinResponseTime := 0;
 
     try
-        lClient:= THttpClientSocket.Open(FHealthURL, FPorta, nlTcp, FConTimeOut);
-        try
-	          lClient.SendTimeout := FReadTimeOut;
-            lClient.ReceiveTimeout := FReadTimeOut;
+        lResposta := FClient.Get(FHealthURL + '/payments/service-health');
 
-            if (lClient.SockConnected) then
-            begin
-                liStatusCode:= lClient.Get('/payments/service-health');
+        if (lResposta.StatusCode = 200) then
+        begin
+            lResJson := TJSONObject.ParseJSONValue(lResposta.ContentAsString) as TJSONObject;
 
-                if (liStatusCode = 200) then
-                begin
-                    lResJson.InitJson(lClient.Content);
-                    lResJson.GetAsBoolean('failing', lFailing);
-                    lResJson.GetAsInteger('minResponseTime', lMinResponseTime);
-
-                    GerarLog('HealthCheck: Failing=' + lFailing.ToString(True) + ' MinResponseTime=' + IntToStr(lMinResponseTime));
-                end
-                else
-                    GerarLog('HealthCheck: Erro na requisição ' + IntToStr(liStatusCode));
-            end
-            else
-                GerarLog('Erro Conectar Health');
-        finally
-            lClient.Free;
-        end;
+            lFailing := (lResJson.GetValue('failing') as TJSONBool).AsBoolean;
+        end
+        else
+            GerarLog('HealthCheck: Erro na requisição ' + IntToStr(lResposta.StatusCode));
     except
         on E: Exception do
             GerarLog('HealthCheck: Erro ' + E.Message);
@@ -152,7 +131,7 @@ end;
 
 procedure TServiceHealthMonitor.SetDefaultAtivo(const AValue: Boolean);
 begin
-    InterlockedExchange(FDefaultAtivo, Ord(AValue));
+    TInterlocked.Exchange(FDefaultAtivo, Ord(AValue));
 end;
 
 procedure TServiceHealthMonitor.VerificarSinal;
@@ -168,12 +147,12 @@ end;
 
 procedure TServiceHealthMonitor.Iniciar;
 begin
-    FThreadMonitorar := TWorkerMonitor.Create(@ThreadMonitorar);
+    FThreadMonitorar := TWorkerMonitor.Create(ThreadMonitorar);
 end;
 
 procedure TServiceHealthMonitor.Finalizar;
 begin
-    if not FMonitoramentoAtivo then
+    if (not FMonitoramentoAtivo) then
         Exit;
 
     FMonitoramentoAtivo := False;
@@ -201,7 +180,7 @@ begin
     end;
 end;
 
-procedure IniciarHealthCk(const AHealthURL: RawUtf8);
+procedure IniciarHealthCk(const AHealthURL: String);
 begin
     ServiceHealthMonitor := TServiceHealthMonitor.Create(AHealthURL);
     ServiceHealthMonitor.Iniciar;

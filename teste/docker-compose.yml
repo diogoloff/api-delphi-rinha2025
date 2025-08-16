@@ -19,44 +19,39 @@ services:
 
   api1: &api
     image: diogoloff/api-delphi-rinha2025:latest
-    depends_on:
-      - persistencia
     hostname: api1
     environment:
       - DEFAULT_URL=http://payment-processor-default:8080
       - FALLBACK_URL=http://payment-processor-fallback:8080
-      - CONSOLIDA_URL=http://persistencia:9090
       - CON_TIME_OUT=5000
       - READ_TIME_OUT=200
-      - NUM_WORKERS=4
-      - NUM_WORKERS_SOCKET=32
-      - NUM_TENTATIVAS_DEFAULT=10
-      - TEMPO_FILA=100
+      - NUM_WORKERS=12
+      - LISTEM_QUEUE=2
+      - NUM_TENTATIVAS_DEFAULT=10 # 5
+      - TEMPO_FILA=10
+      - DEBUG=N
+    volumes:
+      - shm-volume:/dev/shm
+      #- ./Logs/:/opt/rinha/Logs/  #somente se DEBUG=S
     networks:
       - backend-rinha
       - payment-processor
-    #deploy:
-    #  resources:
-    #    limits:
-    #      cpus: "0.40"
-    #      memory: "50MB"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.675" 
+          memory: "150MB"
     
   api2:
     <<: *api
     hostname: api2
+    volumes:
+      - shm-volume:/dev/shm
+      #- ./Logs2/:/opt/rinha/Logs/ #somente se DEBUG=S
 
-  persistencia: 
-    image: diogoloff/persistencia-fpc-rinha2025:latest
-    hostname: persistencia
-    environment:
-      - NUM_WORKERS_SOCKET=32
-    networks:
-      - backend-rinha
-    deploy:
-      resources:
-        limits:
-          cpus: "0.50"
-          memory: "200MB"
+volumes:
+  shm-volume:
+    driver: local
 
 networks:
   backend-rinha:

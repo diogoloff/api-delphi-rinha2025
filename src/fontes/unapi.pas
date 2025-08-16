@@ -1,62 +1,46 @@
 unit unAPI;
 
-{$mode ObjFPC}{$H+}
-
 interface
 
 uses
-    Classes,
-    SysUtils,
-    unGenerica,
-    unRequisicaoPendente,
-    unHealthHelper,
-    mormot.core.base,
-    mormot.core.variants,
-    mormot.core.os,
-    mormot.core.json,
-    mormot.core.text,
-    mormot.core.data,
-    mormot.core.threads,
-    mormot.orm.core,
-    mormot.rest.core,
-    mormot.rest.memserver,
-    mormot.rest.server,
-    mormot.rest.http.server,
-    mormot.net.client,
-    mormot.net.sock;
+    System.Classes, System.JSON, System.SysUtils, System.Threading, System.Generics.Collections,
+    Horse, Horse.Commons, System.SyncObjs,
+    System.Net.HttpClient, System.Net.URLClient, System.NetConsts,
+    unRequisicaoPendente, unHealthHelper, unGenerica, unPersistencia;
 
 type
-{ TApiServer }
+    { TApiServer }
 
     TApiServer = class
     private
-        FModel: TOrmModel;
-        FRest: TRestServerFullMemory;
-        FServerHttp: TRestHttpServer;
-        FClientQuery: THttpClientSocket;
+        procedure RegistrarRotas;
     public
         constructor Create;
         destructor Destroy; override;
 
-        procedure HandlePayments(Context: TRestServerUriContext);
-        procedure HandlePaymentsSummary(Context: TRestServerUriContext);
+        procedure HandlePayments(Req: THorseRequest; Res: THorseResponse; Next: TProc);
+        procedure HandlePaymentsSummary(Req: THorseRequest; Res: THorseResponse; Next: TProc);
     end;
 
-{ TWorkerRequisicao }
+    { TWorkerRequisicao }
 
-    TWorkerRequisicao = class(TSynThread)
+    TWorkerRequisicao = class(TThread)
     private
-        FClientAdd: THttpClientSocket;
+        FIndice: Integer;
+        FClientAdd : THTTPClient;
+        procedure Desempilhar;
     protected
         procedure Execute; override;
     public
-        constructor Create; reintroduce;
+        constructor Create(AIndice: Integer);
         destructor Destroy; override;
     end;
 
 var
-    FilaRequisicoes: TSynQueue;
+    FilaRequisicoes: array of TQueue<TRequisicaoPendente>;
     Workers: array of TWorkerRequisicao;
+    FLocks: array of TObject;
+    FIndex: Integer = 0;
 
 implementation
 
@@ -64,12 +48,16 @@ procedure InicializarFilaEPool;
 var
     I: Integer;
 begin
-    FilaRequisicoes:= TSynQueue.Create(TypeInfo(TRequisicaoTempArray));
+    SetLength(FilaRequisicoes, FNumMaxWorkers);
+    SetLength(FLocks, FNumMaxWorkers);
     SetLength(Workers, FNumMaxWorkers);
 
     for I := 0 to High(Workers) do
     begin
-        Workers[I] := TWorkerRequisicao.Create;
+        FilaRequisicoes[I] := TQueue<TRequisicaoPendente>.Create;
+        FLocks[I] := TObject.Create;
+
+        Workers[I]:= TWorkerRequisicao.Create(I);
         Workers[I].Start;
     end;
 end;
@@ -83,127 +71,157 @@ begin
         Workers[I].Terminate;
         Workers[I].WaitFor;
         Workers[I].Free;
+
+        FilaRequisicoes[i].Free;
+        FLocks[i].Free;
     end;
-
-    FilaRequisicoes.Free;
 end;
 
-procedure AdicionarWorkerFila(ACorrelationId: RawUtf8; AAmount: Double; AAttempt: Integer);
-var
-    lRequisicao: TRequisicaoTemp;
-begin
-    lRequisicao.CorrelationId := ACorrelationId;
-    lRequisicao.Amount := AAmount;
-    lRequisicao.Attempt := AAttempt;
-
-    FilaRequisicoes.Push(lRequisicao);
-end;
-
-procedure Processar(const AReq : TRequisicaoTemp; AClientAdd: THttpClientSocket);
+procedure AdicionarWorkerFila(ACorrelationId: String; AAmount: Double; AAttempt: Integer); overload;
 var
     lRequisicao: TRequisicaoPendente;
+    liIndice: Integer;
 begin
-    lRequisicao:= TRequisicaoPendente.Create(AReq.CorrelationId, AReq.Amount, AReq.Attempt, AClientAdd);
+    lRequisicao := TRequisicaoPendente.Create(ACorrelationId, AAmount, AAttempt);
+
+    liIndice := TInterlocked.Increment(FIndex) mod FNumMaxWorkers;
+
+    TMonitor.Enter(FLocks[liIndice]);
     try
-        if (lRequisicao.Processar) then
-	          Exit;
-
-        if (lRequisicao.attempt > 20) then
-        begin
-	          GerarLog('Descartado: ' + AReq.CorrelationId, True);
-	          Exit;
-	      end;
-
-	      ServiceHealthMonitor.VerificarSinal;
-	      AdicionarWorkerFila(AReq.CorrelationId, AReq.Amount, lRequisicao.attempt);
+        FilaRequisicoes[liIndice].Enqueue(lRequisicao);
     finally
-        lRequisicao.Free;
+        TMonitor.Exit(FLocks[liIndice]);
     end;
+end;
+
+procedure AdicionarWorkerFila(ARequisicao: TRequisicaoPendente); overload;
+var
+    liIndice: Integer;
+begin
+    liIndice := TInterlocked.Increment(FIndex) mod FNumMaxWorkers;
+
+    TMonitor.Enter(FLocks[liIndice]);
+    try
+        FilaRequisicoes[liIndice].Enqueue(ARequisicao);
+    finally
+        TMonitor.Exit(FLocks[liIndice]);
+    end;
+end;
+
+procedure Processar(AReq : TRequisicaoPendente; AClient : THTTPClient);
+begin
+    if (AReq.Processar(AClient)) then
+    begin
+        AReq.Free;
+        Exit;
+    end;
+
+    if (AReq.attempt > 20) then
+    begin
+        GerarLog('Descartado: ' + AReq.CorrelationId, True);
+        AReq.Free;
+        Exit;
+    end;
+
+    ServiceHealthMonitor.VerificarSinal;
+    AdicionarWorkerFila(AReq);
 end;
 
 { TWorkerRequisicao }
 
-procedure TWorkerRequisicao.Execute;
+procedure TWorkerRequisicao.Desempilhar;
 var
-    lRequisicao: TRequisicaoTemp;
+    lRequisicao: TRequisicaoPendente;
+begin
+    if (FilaRequisicoes[FIndice].Count > 0) then
+        lRequisicao := FilaRequisicoes[FIndice].Dequeue
+    else
+        lRequisicao := nil;
+
+    if (Assigned(lRequisicao)) then
+        Processar(lRequisicao, FClientAdd)
+    else
+        Sleep(FTempoFila);
+end;
+
+procedure TWorkerRequisicao.Execute;
 begin
     while not Terminated do
     begin
-        if (FilaRequisicoes.Count > 0) then
-        begin
-            if (FilaRequisicoes.Pop(lRequisicao)) then
-            begin
-                try
-                    try
-                        Processar(lRequisicao, FClientAdd);
-                    finally
-                    end;
-                except
-                    on E: Exception do
-                        GerarLog('Erro Chamada Processar: ' + E.Message, True);
-                end;
-            end
-            else
-                Sleep(FTempoFila);
-        end
-        else
-            Sleep(FTempoFila);
+        try
+            Desempilhar;
+        except
+            on E: Exception do
+                GerarLog(E.Message, True);
+        end;
     end;
 end;
 
-constructor TWorkerRequisicao.Create;
+constructor TWorkerRequisicao.Create(AIndice: Integer);
 begin
-    inherited Create(False);
+    inherited Create(True);
+    FIndice := AIndice;
 
-    FClientAdd:= THttpClientSocket.Open(FUrlConsolida, FPortaConsolida);
-    FClientAdd.SendTimeout:= FReadTimeOut;
-    FClientAdd.ReceiveTimeout:= FReadTimeOut;
+    FClientAdd := THTTPClient.Create;
+    FClientAdd.ConnectionTimeout := FConTimeOut;
+    FClientAdd.ResponseTimeout := FReadTimeOut;
+    FClientAdd.ContentType:= 'application/json';
+    FClientAdd.CustomHeaders['User-Agent'] := 'RinhaDelphi/1.0';
+    FClientAdd.CustomHeaders['Connection'] := 'keep-alive';
+
+    FreeOnTerminate := False;
 end;
 
 destructor TWorkerRequisicao.Destroy;
 begin
     FClientAdd.Free;
-  inherited Destroy;
+    inherited Destroy;
 end;
 
 { TApiServer }
 
-procedure TApiServer.HandlePayments(Context: TRestServerUriContext);
-var
-    lReqJson: TDocVariantData;
-    lCorrelationId: RawUtf8;
-    lAmount: Double;
-    lRetorno: TDocVariantData;
+procedure TApiServer.RegistrarRotas;
 begin
-    lReqJson.InitJson(Context.Call^.InBody);
+    THorse
+        .Group
+            .Route('/payments')
+                .Post(HandlePayments);
 
-    lReqJson.GetAsRawUtf8('correlationId', lCorrelationId);
-    lReqJson.GetAsDouble('amount', lAmount);
-
-    AdicionarWorkerFila(lCorrelationId, lAmount, 0);
-
-    lRetorno.InitJson('', JSON_OPTIONS_FAST);
-    Context.ReturnsJson(Variant(lRetorno), HTTP_SUCCESS);
+    THorse
+        .Group
+              .Route('/payments-summary')
+                  .Get(HandlePaymentsSummary)
 end;
 
-procedure TApiServer.HandlePaymentsSummary(Context: TRestServerUriContext);
+procedure TApiServer.HandlePayments(Req: THorseRequest; Res: THorseResponse; Next: TProc);
 var
-    lsFrom: RawUtf8;
-    lsTo: RawUtf8;
-    lsQuery: RawUtf8;
-    //lClient: THttpClientSocket;
-    liStatusCode: Integer;
-    lRetorno: TDocVariantData;
+    lReqJson: TJSONObject;
+    lCorrelationId: String;
+    lAmount: Double;
 begin
-    if (Context.InputExists['from']) then
-        lsFrom:= Context.InputUtf8['from']
-    else
-        lsFrom:= '';
+    lReqJson := TJSONObject.ParseJSONValue(Req.Body) as TJSONObject;
+    try
+        lCorrelationId := lReqJson.GetValue('correlationId').Value;
+        lAmount := StrToFloat(lReqJson.GetValue('amount').Value);
 
-    if (Context.InputExists['to']) then
-        lsTo:= Context.InputUtf8['to']
-    else
-        lsFrom:= '';
+        Res.ContentType('application/json');
+        Res.Send('{}').Status(THTTPStatus.Ok);
+
+        AdicionarWorkerFila(lCorrelationId, lAmount, 0);
+    finally
+        lReqJson.Free;
+    end;
+end;
+
+procedure TApiServer.HandlePaymentsSummary(Req: THorseRequest; Res: THorseResponse; Next: TProc);
+var
+    lsFrom: String;
+    lsTo: String;
+    lsQuery: String;
+    lResposta: TJSONObject;
+begin
+    lsFrom := Req.Query.Field('from').AsString;
+    lsTo := Req.Query.Field('to').AsString;
 
     lsQuery:= '';
     if Trim(lsFrom) <> '' then
@@ -219,31 +237,15 @@ begin
     if lsQuery <> '' then
         lsQuery:= '?' + lsQuery;
 
-    GerarLog(lsQuery);
+    Res.ContentType('application/json');
 
-    //lClient:= THttpClientSocket.Open(FUrlConsolida, FPortaConsolida, nlTcp, FConTimeOut);
     try
-        //lClient.SendTimeout := FReadTimeOut;
-        //lClient.ReceiveTimeout := FReadTimeOut;
+        lResposta := Persistencia.ConsultarDados(lsFrom, lsTo);
 
-        //if (FClientPer.SockConnected) then
-        //begin
-        //    FHttpLock.Enter;
-        //    try
-                liStatusCode:= FClientQuery.Get('/query' + lsQuery);
-        //    finally
-        //        FHttpLock.Leave;
-        //    end;
-
-            lRetorno.InitJson(FClientQuery.Content, JSON_OPTIONS_FAST);
-
-            if (liStatusCode= 200) then
-                Context.ReturnsJson(Variant(lRetorno), HTTP_SUCCESS)
-            else
-                Context.ReturnsJson(Variant(lRetorno), HTTP_SERVERERROR);
-        //end;
-    finally
-        //lClient.Free;
+        Res.Send(lResposta.ToString).Status(THTTPStatus.Ok)
+    except
+        on E: Exception do
+            Res.Send(E.Message).Status(THTTPStatus.InternalServerError);
     end;
 end;
 
@@ -251,34 +253,55 @@ constructor TApiServer.Create;
 begin
     inherited Create;
 
-    FClientQuery:= THttpClientSocket.Open(FUrlConsolida, FPortaConsolida);
-    FClientQuery.SendTimeout := FReadTimeOut;
-    FClientQuery.ReceiveTimeout := FReadTimeOut;
+    {try
+        TPersistencia.LimparMemoriaCompartilhada;
+    except
+        on E: Exception do
+            GerarLog('Destruir armazenamento: ' + E.Message);
+    end; }
+
+    try
+        Persistencia:= TPersistencia.Create;
+    except
+        on E: Exception do
+            GerarLog('Criar armazenamento: ' + E.Message);
+    end;
 
     IniciarHealthCk(FUrl);
-    InicializarFilaEPool;
 
-    FModel:= TOrmModel.Create([]);
+    try
+        InicializarFilaEPool;
+    except
+        on E: Exception do
+            GerarLog('Criar pool: ' + E.Message);
+    end;
 
-    FRest:= TRestServerFullMemory.Create(FModel);
-    FRest.ServiceMethodRegister('payments', @HandlePayments, true);
-    FRest.ServiceMethodRegister('payments-summary', @HandlePaymentsSummary, true);;
+    TTask.Run(
+    procedure
+    begin
+        THorse.Port := 8080;
+        RegistrarRotas;
 
-    FServerHttp:= TRestHttpServer.Create('8080', [FRest], '+', useHttpSocket, FNumMaxWorkersSocket, secNone, '', '', [rsoAllowSingleServerNoRoot, rsoOnlyJsonRequests]);
+        THorse.ListenQueue := FNumListemQueue;
+        THorse.Listen;
+    end);
 end;
 
 destructor TApiServer.Destroy;
 begin
+    if (THorse.IsRunning) then
+        THorse.StopListen;
+
     FinalizarHealthCk;
     FinalizarFilaEPool;
 
-    FServerHttp.Free;
-    FRest.Free;
-    FModel.Free;
-    FilaRequisicoes.Free;
-    FClientQuery.Free;
+    Persistencia.Free;
+
     inherited Destroy;
 end;
 
-end.
+initialization
 
+finalization
+
+end.

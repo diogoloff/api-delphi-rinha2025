@@ -1,76 +1,49 @@
-unit unRequisicaoPendente;
-
-{$mode ObjFPC}{$H+}
+﻿unit unRequisicaoPendente;
 
 interface
 
 uses
-    Classes,
-    SysUtils,
-    DateUtils,
-    unGenerica,
-    unHealthHelper,
-    mormot.core.base,
-    mormot.core.variants,
-    mormot.core.os,
-    mormot.core.json,
-    mormot.core.text,
-    mormot.core.data,
-    mormot.orm.core,
-    mormot.rest.core,
-    mormot.rest.memserver,
-    mormot.rest.server,
-    mormot.net.client,
-    mormot.core.datetime,
-    mormot.net.sock;
+    System.Classes, System.SysUtils, System.JSON, System.DateUtils,
+    System.Net.HttpClient, System.Net.URLClient, System.NetConsts,
+    unGenerica, unHealthHelper, unPersistencia;
 
 type
-
     { TRequisicaoPendente }
 
     TRequisicaoPendente = class
     private
-        FCorrelationId: RawUtf8;
+        FCorrelationId: String;
         FAmount: Double;
         FAttempt: Integer;
-	      FRequestedAt: RawUtf8;
-        FJsonObj: TDocVariantData;
-        FClientAdd: THttpClientSocket;
+	      FRequestedAt: String;
+        FJsonObj: TJSONObject;
 
 	      procedure AjustarDataHora;
     public
-        constructor Create(const AId: RawUtf8; AAmount: Double; AAttempt: Integer; AClientAdd: THttpClientSocket);
+        constructor Create(const AId: String; AAmount: Double; AAttempt: Integer);
         destructor Destroy; override;
 
-	      function Processar: Boolean;
+	      function Processar(AClient : THTTPClient): Boolean;
 
-        property CorrelationId: RawUtf8 read FCorrelationId;
+        property CorrelationId: String read FCorrelationId;
         property Amount: Double read FAmount;
         property Attempt: Integer read FAttempt write FAttempt;
     end;
-
-    TRequisicaoTemp = record
-        CorrelationId: RawUtf8;
-        Amount: Double;
-        Attempt: Integer;
-    end;
-
-    TRequisicaoTempArray = array of TRequisicaoTemp;
 
 implementation
 
 { TRequisicaoPendente }
 
-constructor TRequisicaoPendente.Create(const AId: RawUtf8; AAmount: Double; AAttempt: Integer; AClientAdd: THttpClientSocket);
+constructor TRequisicaoPendente.Create(const AId: String; AAmount: Double; AAttempt: Integer);
 begin
     FCorrelationId:= AId;
     FAmount:= AAmount;
     FAttempt:= AAttempt;
-    FClientAdd:= AClientAdd;
 
-    FJsonObj.InitFast;
-    FJsonObj.AddValue('correlationId', FCorrelationId);
-    FJsonObj.AddValue('amount', FAmount);
+    FJsonObj:= TJSONObject.Create;
+
+    FJsonObj.AddPair('correlationId', FCorrelationId);
+    FJsonObj.AddPair('amount', TJSONNumber.Create(FAmount));
 end;
 
 destructor TRequisicaoPendente.Destroy;
@@ -80,19 +53,17 @@ end;
 
 procedure TRequisicaoPendente.AjustarDataHora;
 begin
-    //GetUniqueTimestamp;
-    FRequestedAt:= DateTimeToIso8601Text(LocalTimeToUniversal(Now));
+    FRequestedAt:= DateToISO8601(Now);
 
-    FJsonObj.AddOrUpdateValue('requestedAt', FRequestedAt);
+    AddOrUpdatePair(FJsonObj, 'requestedAt', FRequestedAt);
 end;
 
-function TRequisicaoPendente.Processar: Boolean;
+function TRequisicaoPendente.Processar(AClient : THTTPClient): Boolean;
 var
     lbDefault: Boolean;
-    lsURL: RawUtf8;
-    lClient: THttpClientSocket;
-    //lClientPer: THttpClientSocket;
-    liStatusCode: Integer;
+    lsURL: String;
+    lResposta: IHTTPResponse;
+    JsonStream: TStringStream;
 begin
     try
         lbDefault:= True;
@@ -104,57 +75,33 @@ begin
         else
             lsURL:= FUrlFall;
 
-        //lClientPer:= THttpClientSocket.Open(FUrlConsolida, FPortaConsolida, nlTcp, FConTimeOut);
-        lClient:= THttpClientSocket.Open(lsURL, FPorta, nlTcp, FConTimeOut);
-        try
-            //lClientPer.SendTimeout:= FReadTimeOut;
-		        //lClientPer.ReceiveTimeout:= FReadTimeOut;
+        AjustarDataHora;
 
-            lClient.SendTimeout:= FReadTimeOut;
-            lClient.ReceiveTimeout:= FReadTimeOut;
+        JsonStream := TStringStream.Create(FJsonObj.ToString, TEncoding.UTF8);
+        lResposta := AClient.Post(lsURL + '/payments', JsonStream);
 
-            if (lClient.SockConnected) then
-            begin
-                AjustarDataHora;
-                liStatusCode:= lClient.Post('/payments', FJsonObj.ToJson, 'application/json');
+        if (lResposta.StatusCode = 200) then
+        begin
+            if (lbDefault) then
+                AddOrUpdatePair(FJsonObj, 'service', 0)
+            else
+                AddOrUpdatePair(FJsonObj, 'service', 1);
 
-                if (liStatusCode = 200) then
-                begin
-                    if (lbDefault) then
-                        FJsonObj.AddOrUpdateValue('service', 0)
-                    else
-                        FJsonObj.AddOrUpdateValue('service', 1);
+            Persistencia.AdicionarRegistro(TRegistro.Create(FJsonObj));
 
-                    //FHttpLock.Enter;
-                    //try
-                        liStatusCode:= FClientAdd.Post('/add', FJsonObj.ToJson, 'application/json');
-                    //finally
-                    //    FHttpLock.Leave;
-                    //end;
+            if (FAttempt <= FNumTentativasDefault) and (not ServiceHealthMonitor.GetDefaultAtivo) then
+                ServiceHealthMonitor.SetDefaultAtivo(True);
 
-                    if (liStatusCode <> 200) then
-                        GerarLog('Problema: ' + IntToStr(liStatusCode), True);
-
-                    if (FAttempt <= FNumTentativasDefault) and (not ServiceHealthMonitor.GetDefaultAtivo) then
-                        ServiceHealthMonitor.SetDefaultAtivo(True);
-
-                    Result := True;
-                    Exit;
-                end;
-            end;
-        finally
-            lClient.Free;
-            //lClientPer.Free;
+            Result:= True;
+            Exit;
         end;
     except
-    on E: Exception do
-        GerarLog('Erro Processar: ' + E.Message, True);
+        on E: Exception do
+            GerarLog('Erro Processar: ' + E.Message, True);
     end;
 
     Inc(FAttempt);
-    Result := False;
+    Result:= False;
 end;
 
 end.
-
-
