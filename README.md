@@ -5,7 +5,7 @@ Projeto desenvolvido para participar da [Rinha de Backend 2025](https://github.c
 ## 🚀 Tecnologias Utilizadas
 
 - **Linguagem:** Delphi  
-- **Framework:** Horse  
+- **Framework:** Horse ou Indy (É possivel escolher no compose pelo prametro NATIVO, se S é Indy, se N é Horse.
 - **Persistencia:** Própria Memória Compartilhada
 
 ## 📄 Como Rodar
