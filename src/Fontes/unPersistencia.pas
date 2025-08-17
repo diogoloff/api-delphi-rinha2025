@@ -21,22 +21,19 @@ type
         FPtr: Pointer;
         FFD: Integer;
         FSem: PSem_t;
-
     public
         constructor Create;
         destructor Destroy; override;
         procedure AdicionarRegistro(const AReg: TRegistro);
         function LerTodos: TArray<TRegistro>;
         function ConsultarDados(const AFrom, ATo: string): TJSONObject;
-
-        class procedure LimparMemoriaCompartilhada;
     end;
 
 var
     Persistencia: TPersistencia;
 
 const
-    SHM_PATH = '/opt/rinha/persistencia/memoria';
+    SHM_PATH = '/dev/shm/memoria';
     SHM_SIZE = 20 * 1024 * 1024; // 20 MB
     REG_SIZE = SizeOf(TRegistro);
     MAX_REGISTROS = SHM_SIZE div REG_SIZE;
@@ -47,9 +44,7 @@ function CriarSemaforo: PSem_t;
 begin
     Result := sem_open('/semaforo_memoria', O_CREAT, 0666, 1);
     if Result = SEM_FAILED then
-    begin
         raise Exception.Create('Erro ao criar semáforo. Errno: ' + errno.ToString);
-    end;
 end;
 
 { TRegistro }
@@ -63,28 +58,6 @@ begin
 end;
 
 { TPersistencia }
-
-class procedure TPersistencia.LimparMemoriaCompartilhada;
-begin
-    try
-        if FileExists(SHM_PATH) then
-        begin
-            DeleteFile(SHM_PATH);
-            GerarLog('Memória compartilhada removida.');
-        end;
-    except
-        on E: Exception do
-            GerarLog('Erro ao remover memória: ' + E.Message);
-    end;
-
-    try
-        sem_unlink('/semaforo_memoria');
-        GerarLog('Semáforo removido.');
-    except
-        on E: Exception do
-            GerarLog('Erro ao remover semáforo: ' + E.Message);
-    end;
-end;
 
 procedure TPersistencia.AdicionarRegistro(const AReg: TRegistro);
 var
@@ -110,7 +83,10 @@ begin
     end;
 
     if not lbAdicionado then
+    begin
+        Writeln('Memória cheia: Errno: ' + errno.ToString);
         raise Exception.Create('Memória cheia: não foi possível adicionar o registro');
+    end;
 end;
 
 constructor TPersistencia.Create;
@@ -158,7 +134,11 @@ begin
             sem_post(FSem^); // libera
         except
             on E: Exception do
+            begin
+                Writeln('Erro ao resgatar: ' + E.Message);
+                Writeln('Erro ao resgatar: ' + errno.ToString);
                 GerarLog('Erro ao resgatar: ' + E.Message);
+            end;
         end;
 
         Result := lLista.ToArray;
@@ -173,6 +153,8 @@ var
     ldReg: TDateTime;
     ldFrom: TDateTime;
     ldTo: TDateTime;
+    lbFrom: Boolean;
+    lbTo: Boolean;
     TotalDefault: Integer;
     TotalFallback: Integer;
     AmountDefault: Double;
@@ -187,16 +169,20 @@ begin
     AmountDefault := 0;
     AmountFallback := 0;
 
-    ldFrom := ISO8601ToDate(AFrom, True);
-    ldTo := ISO8601ToDate(ATo, True);
+    lbFrom := (Trim(AFrom) <> '') and TryISO8601ToDate(AFrom, ldFrom, True);
+    lbTo := (Trim(ATo) <> '') and TryISO8601ToDate(ATo, ldTo, True);
 
     lTodos := LerTodos;
 
     for lReg in lTodos do
     begin
+        if not TryISO8601ToDate(string(lReg.RequestedAt), ldReg, True) then
+            Continue;
+
         ldReg := ISO8601ToDate(string(lReg.RequestedAt), True);
 
-        if (ldReg >= ldFrom) and (ldReg <= ldTo) then
+         if (not lbFrom or (ldReg >= ldFrom)) and
+            (not lbTo or (ldReg <= ldTo)) then
         begin
             if lReg.Service = 0 then
             begin

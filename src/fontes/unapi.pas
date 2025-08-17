@@ -4,43 +4,58 @@ interface
 
 uses
     System.Classes, System.JSON, System.SysUtils, System.Threading, System.Generics.Collections,
-    Horse, Horse.Commons, System.SyncObjs,
-    System.Net.HttpClient, System.Net.URLClient, System.NetConsts,
-    unRequisicaoPendente, unHealthHelper, unGenerica, unPersistencia;
+    System.SyncObjs, System.Net.HttpClient, System.Net.URLClient, System.NetConsts,
+    unRequisicaoPendente, unHealthHelper, unGenerica, unPersistencia,
+    IdHTTPWebBrokerBridge, Web.HTTPApp, Web.WebReq, undmWebModule,
+    MVCFramework, MVCFramework.Commons,
+    Horse, Horse.Commons;
 
 type
     { TApiServer }
 
     TApiServer = class
     private
+        // Rotas usadas pelo modelo horse
+        procedure HandlePayments(Req: THorseRequest; Res: THorseResponse; Next: TProc);
+        procedure HandlePaymentsSummary(Req: THorseRequest; Res: THorseResponse; Next: TProc);
         procedure RegistrarRotas;
     public
         constructor Create;
         destructor Destroy; override;
-
-        procedure HandlePayments(Req: THorseRequest; Res: THorseResponse; Next: TProc);
-        procedure HandlePaymentsSummary(Req: THorseRequest; Res: THorseResponse; Next: TProc);
     end;
 
     { TWorkerRequisicao }
 
     TWorkerRequisicao = class(TThread)
     private
-        FIndice: Integer;
         FClientAdd : THTTPClient;
         procedure Desempilhar;
     protected
         procedure Execute; override;
     public
-        constructor Create(AIndice: Integer);
+        constructor Create;
         destructor Destroy; override;
     end;
 
+    // Rotas usadas pelo modelo nativo com Indy e undmWebModule
+    [MVCPath('/')]
+    TApiController = class(TMVCController)
+    public
+      [MVCPath('/payments')]
+      [MVCHTTPMethod([httpPOST])]
+      procedure HandlePayments;
+
+      [MVCPath('/payments-summary')]
+      [MVCHTTPMethod([httpGET])]
+      procedure HandlePaymentsSummary;
+    end;
+
 var
-    FilaRequisicoes: array of TQueue<TRequisicaoPendente>;
+    FHTTPServer: TIdHTTPWebBrokerBridge;
+
+    FilaRequisicoes: TQueue<TRequisicaoPendente>;
+    FilaLock: TCriticalSection;
     Workers: array of TWorkerRequisicao;
-    FLocks: array of TObject;
-    FIndex: Integer = 0;
 
 implementation
 
@@ -48,16 +63,12 @@ procedure InicializarFilaEPool;
 var
     I: Integer;
 begin
-    SetLength(FilaRequisicoes, FNumMaxWorkers);
-    SetLength(FLocks, FNumMaxWorkers);
+    FilaRequisicoes := TQueue<TRequisicaoPendente>.Create;
     SetLength(Workers, FNumMaxWorkers);
 
     for I := 0 to High(Workers) do
     begin
-        FilaRequisicoes[I] := TQueue<TRequisicaoPendente>.Create;
-        FLocks[I] := TObject.Create;
-
-        Workers[I]:= TWorkerRequisicao.Create(I);
+        Workers[I]:= TWorkerRequisicao.Create;
         Workers[I].Start;
     end;
 end;
@@ -71,40 +82,32 @@ begin
         Workers[I].Terminate;
         Workers[I].WaitFor;
         Workers[I].Free;
-
-        FilaRequisicoes[i].Free;
-        FLocks[i].Free;
     end;
+
+    FilaRequisicoes.Free;
 end;
 
 procedure AdicionarWorkerFila(ACorrelationId: String; AAmount: Double; AAttempt: Integer); overload;
 var
     lRequisicao: TRequisicaoPendente;
-    liIndice: Integer;
 begin
     lRequisicao := TRequisicaoPendente.Create(ACorrelationId, AAmount, AAttempt);
 
-    liIndice := TInterlocked.Increment(FIndex) mod FNumMaxWorkers;
-
-    TMonitor.Enter(FLocks[liIndice]);
+    FilaLock.Enter;
     try
-        FilaRequisicoes[liIndice].Enqueue(lRequisicao);
+        FilaRequisicoes.Enqueue(lRequisicao);
     finally
-        TMonitor.Exit(FLocks[liIndice]);
+        FilaLock.Leave;
     end;
 end;
 
 procedure AdicionarWorkerFila(ARequisicao: TRequisicaoPendente); overload;
-var
-    liIndice: Integer;
 begin
-    liIndice := TInterlocked.Increment(FIndex) mod FNumMaxWorkers;
-
-    TMonitor.Enter(FLocks[liIndice]);
+    FilaLock.Enter;
     try
-        FilaRequisicoes[liIndice].Enqueue(ARequisicao);
+        FilaRequisicoes.Enqueue(ARequisicao);
     finally
-        TMonitor.Exit(FLocks[liIndice]);
+        FilaLock.Leave;
     end;
 end;
 
@@ -133,10 +136,15 @@ procedure TWorkerRequisicao.Desempilhar;
 var
     lRequisicao: TRequisicaoPendente;
 begin
-    if (FilaRequisicoes[FIndice].Count > 0) then
-        lRequisicao := FilaRequisicoes[FIndice].Dequeue
-    else
-        lRequisicao := nil;
+    FilaLock.Enter;
+    try
+        if (FilaRequisicoes.Count > 0) then
+            lRequisicao := FilaRequisicoes.Dequeue
+        else
+            lRequisicao := nil;
+    finally
+        FilaLock.Leave;
+    end;
 
     if (Assigned(lRequisicao)) then
         Processar(lRequisicao, FClientAdd)
@@ -157,10 +165,9 @@ begin
     end;
 end;
 
-constructor TWorkerRequisicao.Create(AIndice: Integer);
+constructor TWorkerRequisicao.Create;
 begin
     inherited Create(True);
-    FIndice := AIndice;
 
     FClientAdd := THTTPClient.Create;
     FClientAdd.ConnectionTimeout := FConTimeOut;
@@ -223,20 +230,6 @@ begin
     lsFrom := Req.Query.Field('from').AsString;
     lsTo := Req.Query.Field('to').AsString;
 
-    lsQuery:= '';
-    if Trim(lsFrom) <> '' then
-        lsQuery:= 'from=' + lsFrom;
-
-    if Trim(lsTo) <> '' then
-    begin
-        if lsQuery <> '' then
-            lsQuery := lsQuery + '&';
-        lsQuery:= lsQuery + 'to=' + lsTo;
-    end;
-
-    if lsQuery <> '' then
-        lsQuery:= '?' + lsQuery;
-
     Res.ContentType('application/json');
 
     try
@@ -252,6 +245,8 @@ end;
 constructor TApiServer.Create;
 begin
     inherited Create;
+
+    FilaLock:= TCriticalSection.Create;
 
     try
         Persistencia:= TPersistencia.Create;
@@ -273,28 +268,112 @@ begin
         end;
     end;
 
-    TTask.Run(
-    procedure
+    if (FNativo) then
     begin
-        THorse.Port := 8080;
-        RegistrarRotas;
+        WebRequestHandler.WebModuleClass := WebModuleClass;
 
-        THorse.ListenQueue := FNumListemQueue;
-        THorse.Listen;
-    end);
+        FHTTPServer := TIdHTTPWebBrokerBridge.Create(nil);
+        FHTTPServer.DefaultPort := 8080;
+        FHTTPServer.KeepAlive := FKeepAlive;
+
+        WebRequestHandler.MaxConnections:= FMaxConnections;
+        FHTTPServer.MaxConnections := FMaxConnections;
+        FHTTPServer.ListenQueue := FNumListemQueue;
+        FHTTPServer.Active := True;
+    end
+    else
+    begin
+        TTask.Run(
+        procedure
+        begin
+            RegistrarRotas;
+
+            THorse.Port := 8080;
+            THorse.KeepConnectionAlive := FKeepAlive;
+            THorse.MaxConnections := FMaxConnections;
+            THorse.ListenQueue := FNumListemQueue;
+            THorse.Listen;
+        end);
+
+    end;
 end;
 
 destructor TApiServer.Destroy;
 begin
-    if (THorse.IsRunning) then
-        THorse.StopListen;
+    if (FNativo) then
+    begin
+        if FHTTPServer.Active then
+            FHTTPServer.Active := False;
+    end
+    else
+    begin
+        if (THorse.IsRunning) then
+            THorse.StopListen;
+    end;
 
     FinalizarHealthCk;
     FinalizarFilaEPool;
 
     Persistencia.Free;
+    FilaLock.Free;
+
+    FHTTPServer.Free;
 
     inherited Destroy;
+end;
+
+{ TApiController }
+
+procedure TApiController.HandlePayments;
+var
+    lReqJson: TJSONObject;
+    lCorrelationId: string;
+    lAmount: Double;
+begin
+    lReqJson := TJSONObject.ParseJSONValue(Context.Request.Body) as TJSONObject;
+    try
+        lCorrelationId := lReqJson.GetValue('correlationId').Value;
+        lAmount := StrToFloat(lReqJson.GetValue('amount').Value);
+
+        AdicionarWorkerFila(lCorrelationId, lAmount, 0);
+
+        Render('');
+    finally
+      lReqJson.Free;
+    end;
+end;
+
+procedure TApiController.HandlePaymentsSummary;
+var
+    lsFrom: String;
+    lsTo: String;
+    lResposta: TJSONObject;
+begin
+    try
+        lsFrom := Context.Request.QueryParams['from']
+    except
+        lsFrom := '';
+    end;
+
+    try
+        lsTo := Context.Request.QueryParams['to']
+    except
+        lsTo := '';
+    end;
+
+    try
+        try
+            lResposta := Persistencia.ConsultarDados(lsFrom, lsTo);
+        except
+            on E: Exception do
+                Writeln('Erro ' + E.message);
+        end;
+
+        Render(lResposta.ToString);
+    except
+        on E: Exception do
+            Render(500, E.Message);
+    end;
 end;
 
 initialization

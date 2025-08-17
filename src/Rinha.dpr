@@ -16,7 +16,8 @@ uses
   unHealthHelper in 'Fontes\unHealthHelper.pas',
   undmServer in 'Fontes\undmServer.pas' {dmServer: TDataModule},
   unAPI in 'Fontes\unAPI.pas',
-  unPersistencia in 'Fontes\unPersistencia.pas';
+  unPersistencia in 'Fontes\unPersistencia.pas',
+  undmWebModule in 'Fontes\undmWebModule.pas' {dmWebModule: TWebModule};
 
 {$R *.res}
 

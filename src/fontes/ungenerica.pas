@@ -33,6 +33,9 @@ var
     FNumListemQueue: Integer;
     FTempoFila: Integer;
     FNumTentativasDefault: Integer;
+    FNativo: Boolean;
+    FKeepAlive: Boolean;
+    FMaxConnections: Integer;
 
 implementation
 
@@ -117,6 +120,9 @@ begin
     FNumListemQueue := StrToIntDef(GetEnv('LISTEM_QUEUE', ''), 0);
     FTempoFila := StrToIntDef(GetEnv('TEMPO_FILA', ''), 500);
     FNumTentativasDefault := StrToIntDef(GetEnv('NUM_TENTATIVAS_DEFAULT', ''), 5);
+    FNativo := GetEnv('NATIVO', 'N') = 'S';
+    FKeepAlive := GetEnv('KEEP_ALIVE', 'N') = 'S';
+    FMaxConnections := StrToIntDef(GetEnv('MAX_CONNECTIONS', ''), 0);
 
     if FConTimeOut < 0 then
         FConTimeOut := 3000;
