@@ -3,7 +3,7 @@
 interface
 
 uses
-    Posix.SysMman, Posix.Unistd, Posix.Fcntl, Posix.String_, Posix.Stdlib, Posix.Semaphore,
+    Posix.SysMman, Posix.Unistd, Posix.Fcntl, Posix.String_, Posix.Stdlib, Posix.Semaphore, Posix.Errno,
     System.SysUtils, System.Generics.Collections, System.JSON, System.DateUtils, unGenerica;
 
 type
@@ -36,7 +36,7 @@ var
     Persistencia: TPersistencia;
 
 const
-    SHM_PATH = '/dev/shm/bloco_memoria';
+    SHM_PATH = '/opt/rinha/persistencia/memoria';
     SHM_SIZE = 20 * 1024 * 1024; // 20 MB
     REG_SIZE = SizeOf(TRegistro);
     MAX_REGISTROS = SHM_SIZE div REG_SIZE;
@@ -47,7 +47,9 @@ function CriarSemaforo: PSem_t;
 begin
     Result := sem_open('/semaforo_memoria', O_CREAT, 0666, 1);
     if Result = SEM_FAILED then
-        raise Exception.Create('Erro ao criar semáforo');
+    begin
+        raise Exception.Create('Erro ao criar semáforo. Errno: ' + errno.ToString);
+    end;
 end;
 
 { TRegistro }
@@ -115,14 +117,14 @@ constructor TPersistencia.Create;
 begin
     FFD := open(SHM_PATH, O_CREAT or O_RDWR, 0666);
     if FFD = -1 then
-        raise Exception.Create('Erro ao abrir memória');
+        raise Exception.Create('Erro ao abrir memória ' + errno.ToString);
 
     if ftruncate(FFD, SHM_SIZE) = -1 then
-        raise Exception.Create('Erro ao definir tamanho');
+        raise Exception.Create('Erro ao definir tamanho ' + errno.ToString);
 
     FPtr := mmap(nil, SHM_SIZE, PROT_READ or PROT_WRITE, MAP_SHARED, FFD, 0);
     if FPtr = MAP_FAILED then
-        raise Exception.Create('Erro ao mapear memória');
+        raise Exception.Create('Erro ao mapear memória ' + errno.ToString);
 
     FSem := CriarSemaforo;
 end;
@@ -143,16 +145,21 @@ var
 begin
     lLista := TList<TRegistro>.Create;
     try
-        sem_wait(FSem^); // trava
+        try
+            sem_wait(FSem^); // trava
 
-        for I := 0 to MAX_REGISTROS - 1 do
-        begin
-            lPReg := Ptr(UIntPtr(FPtr) + UIntPtr(I * REG_SIZE));
-            if lPReg^.CorrelationId[0] <> #0 then
-                lLista.Add(lPReg^);
+            for I := 0 to MAX_REGISTROS - 1 do
+            begin
+                lPReg := Ptr(UIntPtr(FPtr) + UIntPtr(I * REG_SIZE));
+                if lPReg^.CorrelationId[0] <> #0 then
+                    lLista.Add(lPReg^);
+            end;
+
+            sem_post(FSem^); // libera
+        except
+            on E: Exception do
+                GerarLog('Erro ao resgatar: ' + E.Message);
         end;
-
-        sem_post(FSem^); // libera
 
         Result := lLista.ToArray;
     finally

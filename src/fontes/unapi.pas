@@ -253,18 +253,13 @@ constructor TApiServer.Create;
 begin
     inherited Create;
 
-    {try
-        TPersistencia.LimparMemoriaCompartilhada;
-    except
-        on E: Exception do
-            GerarLog('Destruir armazenamento: ' + E.Message);
-    end; }
-
     try
         Persistencia:= TPersistencia.Create;
     except
         on E: Exception do
+        begin
             GerarLog('Criar armazenamento: ' + E.Message);
+        end;
     end;
 
     IniciarHealthCk(FUrl);
@@ -273,7 +268,9 @@ begin
         InicializarFilaEPool;
     except
         on E: Exception do
+        begin
             GerarLog('Criar pool: ' + E.Message);
+        end;
     end;
 
     TTask.Run(
