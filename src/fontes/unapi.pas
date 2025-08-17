@@ -300,24 +300,65 @@ end;
 
 destructor TApiServer.Destroy;
 begin
-    if (FNativo) then
-    begin
-        if FHTTPServer.Active then
-            FHTTPServer.Active := False;
-    end
-    else
-    begin
-        if (THorse.IsRunning) then
-            THorse.StopListen;
+    try
+        Writeln('Parando Server');
+        if (FNativo) then
+        begin
+            if FHTTPServer.Active then
+                FHTTPServer.Active := False;
+        end
+        else
+        begin
+            if (THorse.IsRunning) then
+                THorse.StopListen;
+        end;
+
+        Writeln('Server Parado');
+    except
+        on E: Exception do
+            Writeln('Erro ao Parar Server: ' + E.Message);
     end;
 
-    FinalizarHealthCk;
-    FinalizarFilaEPool;
+    try
+        Writeln('Finalizando Health');
+        FinalizarHealthCk;
+        Writeln('Health Finalizado');
+    except
+        on E: Exception do
+            Writeln('Erro ao Finalizar Health: ' + E.Message);
+    end;
 
-    Persistencia.Free;
-    FilaLock.Free;
+    try
+        Writeln('Finalizando Fila e Pool');
+        FinalizarFilaEPool;
+        FilaLock.Free;
+        Writeln('Fila e Pool Finalizado');
+    except
+        on E: Exception do
+            Writeln('Erro ao Finalizar Fila e Pool: ' + E.Message);
+    end;
 
-    FHTTPServer.Free;
+    try
+        Writeln('Finalizando HttpServer');
+        FHTTPServer.Free;
+        Writeln('HttpServer Finalizado');
+    except
+        on E: Exception do
+            Writeln('Erro ao Finalizar HttpServer: ' + E.Message);
+    end;
+
+    try
+        Writeln('Finalizando Persistencia');
+        Persistencia.Free;
+        Writeln('Persistencia Finalizado');
+    except
+        on E: Exception do
+            Writeln('Erro ao Finalizar Persistencia: ' + E.Message);
+    end;
+
+    Writeln('Finalizando Memoria');
+    TPersistencia.LimparMemoriaCompartilhada;
+    Writeln('Memoria Finalizado');
 
     inherited Destroy;
 end;

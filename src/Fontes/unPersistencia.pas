@@ -27,6 +27,7 @@ type
         procedure AdicionarRegistro(const AReg: TRegistro);
         function LerTodos: TArray<TRegistro>;
         function ConsultarDados(const AFrom, ATo: string): TJSONObject;
+        class procedure LimparMemoriaCompartilhada;
     end;
 
 var
@@ -58,6 +59,28 @@ begin
 end;
 
 { TPersistencia }
+
+class procedure TPersistencia.LimparMemoriaCompartilhada;
+begin
+    try
+        if FileExists(SHM_PATH) then
+        begin
+            DeleteFile(SHM_PATH);
+            WriteLn('Memória compartilhada removida.');
+        end;
+    except
+        on E: Exception do
+            WriteLn('Erro ao remover memória: ', E.Message);
+    end;
+
+    try
+        sem_unlink('/semaforo_memoria');
+        WriteLn('Semáforo removido.');
+    except
+        on E: Exception do
+            WriteLn('Erro ao remover semáforo: ', E.Message);
+    end;
+end;
 
 procedure TPersistencia.AdicionarRegistro(const AReg: TRegistro);
 var
